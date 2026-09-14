@@ -33,6 +33,15 @@ class DAPORewardManagerNemotron(RewardManagerBase):
         overlong_penalty_cfg = config.reward.get("reward_kwargs", {}).get("overlong_penalty", None)
         self.overlong_penalty_cfg = overlong_penalty_cfg
         self.max_resp_len = config.reward.get("reward_kwargs", {}).get("max_resp_len", None)
+        # Per-ability reward/count metrics (was hardcoded to multi-domain-RL's 3 domains via a
+        # fixed agent_ref->display-name dict below) -- now config-driven so any stage's launch.sh
+        # declares its own dataset's ability names, e.g. MOPD's 5 (mcqa/structured_outputs/
+        # workplace_assistant/math/instruction_following) vs. multi-domain-RL's 3, without
+        # touching this file. `non_tensor_batch` requires every row to carry the same columns, so
+        # this list must be declared somewhere -- config is the right place, not a code literal
+        # tied to one dataset. Empty by default: no config entry means no per-ability metrics,
+        # same as before this existed.
+        self.track_domains = config.reward.get("reward_kwargs", {}).get("track_domains", [])
         self.reward_router_address = reward_router_address
         self.reward_model_tokenizer = reward_model_tokenizer 
         self.eos_id = self.tokenizer.eos_token_id
