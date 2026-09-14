@@ -814,3 +814,42 @@ class Gemma4ToolParser(ToolParser):
         content_idx = text.find(self.tool_call_start_token)
         content = text[:content_idx] if content_idx >= 0 else text
         return content, function_calls
+
+
+@ToolParser.register("hermes_single_tool_call")
+class HermesSingleToolCallParser(HermesToolParser):
+    """A genuinely separate mechanism from `AllToolCallsAgentLoop` above -- that class controls
+    *execution* (how many emitted calls get run/recorded); this controls *generation* (how many
+    calls the model is even able to emit before decoding is cut off). They live in different VERL
+    registries (`ToolParser` vs the tool-agent-loop `AgentLoop`, selected independently via
+    `multi_turn.format` vs `agent_name`) and can't be merged into one class -- this is here
+    alongside `AllToolCallsAgentLoop` for cohesion, not because it plugs into it directly.
+
+    Not something dragon-agentic does either, for the record (checked: its `chat.completions.
+    create` call passes no `parallel_tool_calls` and no stop-token equivalent -- see
+    `AllToolCallsAgentLoop`'s docstring). This is the direct answer to "how do I make the model
+    only emit one tool call per turn" as its own question, not a port of anything dragon-agentic
+    has.
+
+    Mechanism: `HermesToolParser.stop_token_ids` (the base `ToolParser`'s default) returns `[]`,
+    so nothing stops decoding once the model starts a `<tool_call>` block -- it can keep emitting
+    more of them until it independently chooses to stop (see the base class's own docstring:
+    "Models like Qwen3 naturally emit EOS after a tool call, so no extra stop tokens are needed" --
+    an assumption, not a guarantee). Overriding `stop_token_ids` to include `</tool_call>`'s token
+    id (confirmed via the actual Qwen2.5/Qwen3 tokenizer configs on disk: id 151658, same for
+    both) makes vLLM halt decoding the instant that tag is emitted -- structurally impossible for
+    a second `<tool_call>` to exist in the same turn's output afterward, no reliance on the
+    model's own judgment.
+
+    To use: set `actor_rollout_ref.rollout.multi_turn.format=hermes_single_tool_call` in place of
+    `format=hermes` in `launch.sh` -- orthogonal to whichever `agent_name` (i.e. whichever class
+    above) is selected. Once this is active, `AllToolCallsAgentLoop`'s cap-and-refuse logic
+    (`_refuse_tool_call`) should essentially never fire in practice, since `agent_data.tool_calls`
+    will almost always have length <= 1 per turn by construction -- it remains in place purely as
+    a defensive backstop for whatever edge case might let a second call through anyway (e.g. a
+    tokenizer/decoding quirk), not as the primary enforcement mechanism once this parser is active.
+    """
+
+    @property
+    def stop_token_ids(self) -> list[int]:
+        return [self.tokenizer.convert_tokens_to_ids(self.tool_call_end_token)]

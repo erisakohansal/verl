@@ -605,6 +605,11 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    if "overlong_filtering" in batch.non_tensor_batch:
+      overlong_filtering = batch.non_tensor_batch["overlong_filtering"].astype(bool)
+      metrics["overlong_filtering/rate"] = overlong_filtering.mean()
+
+
     return metrics
 
 

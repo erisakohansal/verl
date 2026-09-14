@@ -18,6 +18,7 @@ from .gdpo import GDPORewardManager
 from .naive import NaiveRewardManager
 from .limited import RateLimitedRewardManager
 from .remote import RemoteRewardManager
+from .dapo_overlong_penalty import DAPORewardManagerNemotron
 
 __all__ = [
     "DAPORewardManager",
@@ -27,4 +28,5 @@ __all__ = [
     "RemoteRewardManager",
     "register",
     "get_reward_manager_cls",
+    "DAPORewardManagerNemotron"
 ]

@@ -331,6 +331,170 @@ def compute_grpo_outcome_advantage(
     return scores, scores
 
 
+@register_adv_est("grpo_reward_shaped")
+def compute_grpo_reward_shaped_advantage(
+    token_level_rewards, response_mask, index, epsilon=1e-6, norm_adv_by_std_in_grpo=True, config=None,
+):
+    assert norm_adv_by_std_in_grpo, (
+        "grpo_reward_shaped tanh-bounds a z-score; with norm_adv_by_std_in_grpo=False "
+        "the input is only mean-centered, not scaled, which isn't the paper's formula."
+    )
+    advantages, returns = compute_grpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        epsilon=epsilon,
+        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        config=config,
+    )
+    shaped = torch.tanh(advantages)
+    return shaped, shaped
+
+
+# UPDATE (2026-09-05): "Group Relative Length Control" -- Nemotron 3 Nano
+# (Blakeman et al., 2025, arXiv:2512.20848) SS3.3.2 -- composed with the
+# tanh-bounded reward shaping above. Two mechanisms from that section, "answer"
+# term only (this policy is non-thinking, no separate "think" component to
+# control):
+#   1. Length-Normalized Reward Adjustment (their eq. 4-6): within each GRPO
+#      group, min-max-normalize each response's length (1=shortest,
+#      0=longest), center it (zero-sum across the group -- a redistribution,
+#      not a scale change), scale by LENGTH_ADJ_LAMBDA, add to the base reward.
+#   2. Quality-Gated Conciseness Bonus: the single shortest response in the
+#      group gets one more flat bonus (CONCISENESS_BETA), but ONLY if its
+#      *original, unadjusted* reward already clears the group's
+#      CONCISENESS_PERCENTILE-th percentile -- short-and-bad never gets this,
+#      only short-and-already-good does.
+# Order matters: both operate on the RAW per-response reward (the length bias
+# in *what gets rewarded*), and only then does the existing z-score+tanh step
+# run on the result (numerical *stability* of an already-debiased signal) --
+# doing it the other way (tanh first) would let a later additive term push
+# values back outside tanh's [-1, 1] range, defeating the point of bounding it.
+LENGTH_ADJ_LAMBDA = 0.5  # paper: lambda^(answer) = 0.5
+CONCISENESS_BETA = 0.5  # paper: beta^(answer) = 0.5
+CONCISENESS_PERCENTILE = 80.0  # paper: tau_p = 80
+
+
+# UPDATE (2026-09-08): split into (a) a shared helper computing the
+# length-adjusted token_level_rewards, and (b) two thin wrappers -- one that
+# tanh-shapes the result (grpo_length_shaped, for the combined-fix run) and
+# one that doesn't (grpo_length_only, isolates the length-control mechanism
+# alone). Ablation purpose: an earlier run reward-hacked; isolating length
+# control from reward shaping tells us which piece is actually doing the
+# work, rather than only ever testing them bundled together.
+def _apply_group_length_control(token_level_rewards, response_mask, index, epsilon):
+    """Returns adjusted token_level_rewards with the length-normalized reward
+    adjustment + quality-gated conciseness bonus applied. Does NOT compute an
+    advantage or apply any shaping -- callers do that with whatever estimator
+    they want on top (see compute_grpo_length_shaped_advantage /
+    compute_grpo_length_advantage below)."""
+    scores = token_level_rewards.sum(dim=-1)  # R_base per response
+    lengths = response_mask.sum(dim=-1).float()  # per-response length, free from the mask
+
+    bsz = scores.shape[0]
+    id2rows: dict = defaultdict(list)
+    for i in range(bsz):
+        id2rows[index[i]].append(i)
+
+    adjusted = scores.clone()
+    with torch.no_grad():
+        for rows in id2rows.values():
+            if len(rows) < 2:
+                continue  # length/percentile comparisons need >=2 responses in the group
+            rows_t = torch.tensor(rows, device=scores.device)
+            grp_len = lengths[rows_t]
+            grp_score = scores[rows_t]
+            valid = grp_len > 0  # skip fully-empty (failed) responses -- no real length to compare
+            if valid.sum() < 2:
+                continue
+
+            # --- 1. Length-Normalized Reward Adjustment ---
+            len_min = grp_len[valid].min()
+            len_max = grp_len[valid].max()
+            w = torch.zeros_like(grp_len)
+            if (len_max - len_min) > epsilon:
+                w[valid] = 1.0 - (grp_len[valid] - len_min) / (len_max - len_min)
+            w_centered = torch.zeros_like(w)
+            w_centered[valid] = w[valid] - w[valid].mean()
+            adjusted[rows_t] = adjusted[rows_t] + LENGTH_ADJ_LAMBDA * w_centered
+
+            # --- 2. Quality-Gated Conciseness Bonus ---
+            tau_p = torch.quantile(grp_score[valid], CONCISENESS_PERCENTILE / 100.0)
+            valid_local_idx = valid.nonzero(as_tuple=True)[0]
+            min_len_local = valid_local_idx[torch.argmin(grp_len[valid_local_idx])]
+            min_len_row = rows[min_len_local]
+            if scores[min_len_row] >= tau_p:  # gate on the ORIGINAL (pre-adjustment) score
+                adjusted[min_len_row] = adjusted[min_len_row] + CONCISENESS_BETA
+
+    delta = adjusted - scores
+
+    # Place each response's delta at its own last valid token so `.sum(dim=-1)`
+    # downstream picks it up regardless of where the original tensor placed
+    # its scalar reward. Skip rows with no valid response tokens at all.
+    seq_len = response_mask.shape[-1]
+    idx_range = torch.arange(seq_len, device=response_mask.device).unsqueeze(0)
+    has_valid = response_mask.sum(dim=-1) > 0
+    masked_idx = idx_range * response_mask.long()
+    last_valid_idx = masked_idx.argmax(dim=-1)
+    delta_tensor = torch.zeros_like(token_level_rewards)
+    rows_with_valid = has_valid.nonzero(as_tuple=True)[0]
+    delta_tensor[rows_with_valid, last_valid_idx[rows_with_valid]] = delta[rows_with_valid]
+
+    adjusted_token_level_rewards = token_level_rewards + delta_tensor
+    return adjusted_token_level_rewards
+
+
+@register_adv_est("grpo_length_shaped")
+def compute_grpo_length_shaped_advantage(
+    token_level_rewards, response_mask, index, epsilon=1e-6, norm_adv_by_std_in_grpo=True, config=None,
+):
+    """Length control + tanh reward shaping, composed (the combined-fix run)."""
+    assert norm_adv_by_std_in_grpo, (
+        "grpo_length_shaped tanh-bounds a z-score (same as grpo_reward_shaped); "
+        "with norm_adv_by_std_in_grpo=False the input is only mean-centered, not "
+        "scaled, which isn't the paper's formula."
+    )
+    adjusted_token_level_rewards = _apply_group_length_control(
+        token_level_rewards=token_level_rewards, response_mask=response_mask, index=index, epsilon=epsilon,
+    )
+    advantages, returns = compute_grpo_outcome_advantage(
+        token_level_rewards=adjusted_token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        epsilon=epsilon,
+        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        config=config,
+    )
+    shaped = torch.tanh(advantages)
+    return shaped, shaped
+
+
+# UPDATE (2026-09-08): ablation arm -- length control ALONE, no tanh reward
+# shaping, requested to isolate which of the two mechanisms in
+# grpo_length_shaped is actually responsible for any effect once run. Pairs
+# with the already-existing grpo_reward_shaped (tanh shaping alone, no length
+# control) for a clean 2x2-ish comparison: plain grpo / grpo_reward_shaped /
+# grpo_length_only / grpo_length_shaped.
+@register_adv_est("grpo_length_only")
+def compute_grpo_length_advantage(
+    token_level_rewards, response_mask, index, epsilon=1e-6, norm_adv_by_std_in_grpo=True, config=None,
+):
+    """Length control only -- no tanh reward shaping on top. Ablation arm to
+    isolate the length-control mechanism from grpo_length_shaped's tanh step."""
+    adjusted_token_level_rewards = _apply_group_length_control(
+        token_level_rewards=token_level_rewards, response_mask=response_mask, index=index, epsilon=epsilon,
+    )
+    advantages, returns = compute_grpo_outcome_advantage(
+        token_level_rewards=adjusted_token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        epsilon=epsilon,
+        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        config=config,
+    )
+    return advantages, returns
+
+
 @register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)
 def compute_grpo_vectorized_outcome_advantage(
     token_level_rewards: torch.Tensor,

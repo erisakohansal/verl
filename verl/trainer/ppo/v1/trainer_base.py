@@ -1267,6 +1267,54 @@ class PPOTrainer(ABC):
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
 
+            # process_validation_metrics averages "X reward"/"X count" over the WHOLE validation
+            # set (every ability's rows, since dapo_overlong_penalty.py's `track_domains` config
+            # makes "X reward"/"X count" 0.0 for every non-matching row, not just the configured
+            # ability's own) -- diluted by ability share instead of the true ability-conditional
+            # mean. Overwrite each ability's "reward/mean@N" with the properly normalized
+            # sum(reward)/sum(count), add a real integer count alongside it, and the same
+            # dilution applies to num_turns (single-turn abilities always report exactly 1 turn --
+            # their share of the batch drags the blended mean toward 1 regardless of what a
+            # tool-calling ability's turn count is doing).
+            #
+            # Domains discovered from the "{X} count"/"{X} reward" key-naming convention itself
+            # (was a hardcoded 3-item list tied to multi-domain-RL specifically) -- whatever
+            # `reward.reward_kwargs.track_domains` a given launch.sh configured is what shows up
+            # here, so a 5-domain dataset like MOPD's is covered the same way a 3-domain one like
+            # multi-domain-RL's already was, with no code change needed here when a future stage
+            # configures its own domain list again.
+            tracked_domains = sorted(
+                key[: -len(" count")]
+                for key in reward_extra_infos_dict
+                if key.endswith(" count") and f"{key[: -len(' count')]} reward" in reward_extra_infos_dict
+            )
+            for domain in tracked_domains:
+                count_key = f"{domain} count"
+                reward_key = f"{domain} reward"
+                total_count = sum(reward_extra_infos_dict[count_key])
+                total_reward = sum(reward_extra_infos_dict[reward_key])
+                true_mean = total_reward / total_count if total_count > 0 else 0.0
+
+                for key in list(metric_dict.keys()):
+                    if f"/{reward_key}/mean@" in key:
+                        metric_dict[key] = true_mean
+
+                metric_dict[f"val-aux/{domain}/total_count"] = total_count
+
+                # sample_turns and reward_extra_infos_dict are extended in the same per-batch
+                # loop, same row order (trainer_base.py:1038-1054) -- safe to zip positionally.
+                # Length check guards against that assumption ever silently breaking.
+                if len(sample_turns) == len(reward_extra_infos_dict[count_key]):
+                    domain_turns = [
+                        t for t, c in zip(sample_turns, reward_extra_infos_dict[count_key]) if c == 1
+                    ]
+                    if domain_turns:
+                        domain_turns_arr = np.array(domain_turns)
+                        metric_dict[f"val-aux/{domain}/num_turns/mean"] = domain_turns_arr.mean()
+                        metric_dict[f"val-aux/{domain}/num_turns/min"] = domain_turns_arr.min()
+                        metric_dict[f"val-aux/{domain}/num_turns/max"] = domain_turns_arr.max()
+
+
         if len(sample_turns) > 0:
             sample_turns = np.array(sample_turns)
             metric_dict["val-aux/num_turns/min"] = sample_turns.min()
@@ -1797,6 +1845,28 @@ class PPOTrainer(ABC):
                 "training/num_turns/min": num_turns.min(),
             }
         )
+
+        # Per-ability training-step counts and de-diluted mean reward -- same reasoning and
+        # pattern as _val_metrics_update's per-ability block: "X reward"/"X count" are 0.0 for
+        # non-matching rows by construction (dapo_overlong_penalty.py's `track_domains` config),
+        # so a naive mean over the whole step's batch is diluted by ability share, not the true
+        # ability-conditional mean. Domains discovered from the "{X} count"/"{X} reward"
+        # key-naming convention itself (was a hardcoded 3-item list tied to multi-domain-RL
+        # specifically) -- see _val_metrics_update's own comment for why this generalizes to any
+        # dataset's `reward.reward_kwargs.track_domains` config with no code change here.
+        tracked_domains = sorted(
+            key[: -len(" count")]
+            for key in metrics_batch.non_tensor_batch
+            if key.endswith(" count") and f"{key[: -len(' count')]} reward" in metrics_batch.non_tensor_batch
+        )
+        for domain in tracked_domains:
+            count_key = f"{domain} count"
+            reward_key = f"{domain} reward"
+            if count_key in metrics_batch.non_tensor_batch and reward_key in metrics_batch.non_tensor_batch:
+                total_count = metrics_batch.non_tensor_batch[count_key].sum()
+                total_reward = metrics_batch.non_tensor_batch[reward_key].sum()
+                metrics[f"training/{domain}/sample_count"] = total_count
+                metrics[f"training/{domain}/reward"] = total_reward / total_count if total_count > 0 else 0.0
 
         # 4. per-request speculative-decoding aggregation (same metrics async PPO logs;
         # see compute_spec_decode_metrics in verl/trainer/ppo/ray_trainer.py).
