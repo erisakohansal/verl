@@ -159,19 +159,14 @@ class DAPORewardManagerNemotron(RewardManagerBase):
             if is_overlong:   
                 reward = 0.0
 
-        agent_ref = extra_info.get("agent_ref", None)
-        if agent_ref:
-            domains = {
-                "mcqa_simple_agent": "mcqa",
-                "workplace_assistant_simple_agent": "workplace assistant",
-                "structured_outputs_simple_agent": "structured outputs",
-            }
-            for domain in domains.keys():
-                is_domain = agent_ref == domain
-                reward_extra_info[f"{domains[domain]} reward"] = (
+        ability = data_item.non_tensor_batch.get("ability")
+        if ability:
+            for tracked_domain in self.track_domains:
+                is_domain = ability == tracked_domain
+                reward_extra_info[f"{tracked_domain} reward"] = (
                     float(reward) if is_domain else 0.0
                 )
-                reward_extra_info[f"{domains[domain]} count"] = float(is_domain)
+                reward_extra_info[f"{tracked_domain} count"] = float(is_domain)
 
         if overlong_filtering:
             reward_extra_info["overlong_filtering"] = 1.
