@@ -285,21 +285,6 @@ def masked_sum(values: torch.Tensor, mask: torch.Tensor, axis: int | tuple[int, 
     Returns:
         torch.Tensor: Sum of masked values, reduced along specified axis.
     """
-    # UPDATE: use_remove_padding=True packs `values` into a jagged-layout
-    # NestedTensor, but `mask` (loss_mask etc.) is never packed alongside it
-    # -- torch.where's NestedTensor dispatch requires the condition to be a
-    # matching jagged tensor too, so calling it with a nested `values` and a
-    # dense `mask` crashes: "expected condition to be a jagged layout
-    # NestedTensor". A packed/jagged tensor has no padding left by
-    # construction (that's the entire point of remove_padding) -- every
-    # element it holds is real data, so masking is a no-op in that case;
-    # skip straight to summing instead of building an incompatible
-    # torch.where. Confirmed against the crash directly (MOPD's distillation
-    # loss path, compute_policy_loss_vanilla -> agg_loss -> masked_sum), not
-    # reconstructed from the NestedTensor docs alone.
-    if isinstance(values, torch.Tensor) and values.is_nested and not (isinstance(mask, torch.Tensor) and mask.is_nested):
-        return values.sum(axis=axis)
-
     # If NaNs exist out of mask, replace NaNs in values with a value that
     # won't affect the sum (e.g., 0 for masked regions)
     valid_values = torch.where(mask.bool(), values, 0.0)

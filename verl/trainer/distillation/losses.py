@@ -276,7 +276,18 @@ def distillation_loss(
             old_log_prob = data["old_log_probs"].to_padded_tensor(0.0)
         if response_mask.is_nested:
             response_mask = response_mask.to_padded_tensor(False)
+        # UPDATE: the missing conversion -- old_log_prob and response_mask both get
+        # is_nested -> to_padded_tensor(...) above, but rollout_is_weights never did.
+        # compute_policy_loss_vanilla does `pg_losses = pg_losses * rollout_is_weights`
+        # against an already-padded pg_losses; multiplying by a still-jagged
+        # rollout_is_weights is what makes THAT result nested, which is what actually
+        # reaches masked_sum's torch.where and crashes -- not values being genuinely
+        # packed data. Fill value 0.0 matches old_log_prob's own padding fill just
+        # above; padded positions get excluded by response_mask in agg_loss regardless,
+        # so the exact fill value here doesn't affect the loss, only avoids the crash.
         rollout_is_weights = data.get("rollout_is_weights", None)
+        if rollout_is_weights is not None and rollout_is_weights.is_nested:
+            rollout_is_weights = rollout_is_weights.to_padded_tensor(0.0)
         distillation_loss, pg_metrics = policy_loss_fn(
             old_log_prob=old_log_prob,
             log_prob=log_prob,
