@@ -523,6 +523,12 @@ class FSDPEngine(BaseEngine):
                 min_lr_ratio=min_lr_ratio,
                 num_cycles=num_cycles,
                 zero_indexed_step=zero_indexed_step,
+                # PATCH (2026-09-15): thread through the nonzero-warmup-floor param the underlying
+                # function already supported but this call site never passed -- see
+                # FSDPOptimizerConfig.init_lr_ratio's own docstring for why (Cascade 2 MOPD's
+                # warmup-from-2e-7 requirement). optim_config.init_lr_ratio defaults to None, which
+                # get_cosine_schedule_with_warmup already treats as 0.0 (unchanged behavior).
+                init_lr_ratio=optim_config.init_lr_ratio,
             )
         else:
             raise NotImplementedError(f"LR scheduler type {lr_scheduler_type} is not supported")

@@ -98,6 +98,14 @@ class FSDPOptimizerConfig(OptimizerConfig):
         num_cycles (float): Number of cosine cycles in LR schedule.
         zero_indexed_step (bool): Whether the LR schedule uses 0-indexed steps. If True (default),
             step counting starts at 0. If False, step counting starts at 1.
+        init_lr_ratio (Optional[float]): Initial LR ratio w.r.t. the max LR at the start of warmup
+            (cosine schedule only -- see get_cosine_schedule_with_warmup's own `init_lr_ratio` param,
+            which this field threads through from _build_lr_scheduler). None/0.0 means warmup starts
+            from 0, matching the historical default. Added 2026-09-15 to support recipes (e.g. the
+            Cascade 2 paper's MOPD stage, "linear warm-up over the first 30 steps starting from
+            2e-7" up to lr=2e-6) that need a nonzero warmup floor -- the underlying scheduler
+            function already supported this, it just wasn't wired up to any FSDP-reachable config
+            field before this patch.
     """
 
     _mutable_fields = OptimizerConfig._mutable_fields.copy()
@@ -112,6 +120,7 @@ class FSDPOptimizerConfig(OptimizerConfig):
     num_cycles: float = 0.5
     override_optimizer_config: Optional[dict] = None
     zero_indexed_step: bool = True
+    init_lr_ratio: Optional[float] = None
 
     def __post_init__(self):
         if self.warmup_style is not None:
@@ -121,6 +130,13 @@ class FSDPOptimizerConfig(OptimizerConfig):
             )
             self.lr_scheduler_type = self.warmup_style
         assert self.lr_scheduler_type in ["constant", "cosine"]
+        if self.init_lr_ratio is not None:
+            assert self.lr_scheduler_type == "cosine", (
+                "init_lr_ratio (nonzero warmup floor) is only wired through get_cosine_schedule_with_warmup; "
+                "set lr_scheduler_type=cosine to use it (min_lr_ratio=1.0 flattens the post-warmup decay to "
+                "constant, if a plain warmup-then-hold recipe is wanted instead of an actual cosine decay)."
+            )
+            assert 0.0 <= self.init_lr_ratio <= 1.0
         return super().__post_init__()
 
 

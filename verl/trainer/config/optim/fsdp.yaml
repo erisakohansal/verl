@@ -41,6 +41,11 @@ lr_scheduler_type: constant
 # Whether the LR schedule uses 0-indexed steps
 zero_indexed_step: true
 
+# Initial LR ratio w.r.t. the max LR at the start of warmup (cosine schedule only). null means
+# warmup starts from 0 (historical default). Set e.g. 0.1 for a recipe needing warmup to start
+# from 10% of the target LR instead of 0.
+init_lr_ratio: null
+
 # deprecated
 warmup_style: null
 
